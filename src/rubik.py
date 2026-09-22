@@ -18,7 +18,7 @@ class Direction(Enum):
     NEGATIVE = auto()
 
 class FaceSide(Enum):
-    NORHT = auto()
+    NORTH = auto()
     EAST = auto()
     SOUTH = auto()
     WEST = auto()
@@ -99,7 +99,7 @@ class CubeFace():
     def __init__(self, value: int) -> None:
         self.values = [[value for c in range(3)] for r in range(3)]
         self.neighbor_faces = {
-            FaceSide.NORHT: None,
+            FaceSide.NORTH: None,
             FaceSide.SOUTH: None,
             FaceSide.EAST: None,
             FaceSide.WEST: None
