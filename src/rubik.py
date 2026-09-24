@@ -50,34 +50,34 @@ class RubikCube():
         )
 
         RubikCube.set_sides(self.faces[2], (
-            self.faces[4],
-            self.faces[3],
             self.faces[5],
+            self.faces[3],
+            self.faces[4],
             self.faces[1]),
             (RubikCube.CBA, RubikCube.DEF)
         )
 
         RubikCube.set_sides(self.faces[3], (
-            self.faces[4],
-            self.faces[0],
             self.faces[5],
+            self.faces[0],
+            self.faces[4],
             self.faces[2]),
             (RubikCube.IHG, RubikCube.DEF)
         )
 
         RubikCube.set_sides(self.faces[4], (
             self.faces[2],
-            self.faces[1],
+            self.faces[3],
             self.faces[0],
-            self.faces[3]),
+            self.faces[1]),
             (RubikCube.ABC, RubikCube.IHG)
         )
 
         RubikCube.set_sides(self.faces[5], (
             self.faces[1],
-            self.faces[2],
-            self.faces[4],
-            self.faces[0]),
+            self.faces[0],
+            self.faces[3],
+            self.faces[2]),
             (RubikCube.GHI, RubikCube.CBA)
         )
 
