@@ -1,5 +1,6 @@
+from random import choice, randint
 from rubik import FaceSide
-from rubik import RubikCube, CubeFace, Axis, Direction
+from rubik import RubikCube, CubeFace, Axis, Direction, Move
 import pytest
 
 def test_rubik_class():
@@ -55,6 +56,20 @@ def test_rubik_turning():
         turns_twice(my_cube, ax, Direction.POSITIVE)
     for ax in RubikCube.GHI:
         turns_twice(my_cube, ax, Direction.POSITIVE)
+
+def test_history():
+    my_cube = RubikCube()
+    turn_amount = 20
+    for r in range(turn_amount):
+        ax = choice(tuple(Axis))
+        direction = choice(tuple(Direction))
+        times = randint(1, 3)
+        my_cube.turn(ax, direction, times)
+
+    for r in range(turn_amount):
+        my_cube.revert_last_move()
+
+    assert my_cube.is_solved()
 
 def turns_one_by_one(cube: RubikCube, axis: Axis, direction: Direction) -> None:
     cube.turn(axis, direction, 1)

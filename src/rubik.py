@@ -39,6 +39,7 @@ class RubikCube():
 
     def __init__(self) -> None:
         self.faces = tuple(CubeFace(i) for i in range(6))
+        self.history: list[Move] = []
 
         RubikCube.set_sides(self.faces[0], (
             self.faces[4],
@@ -97,7 +98,13 @@ class RubikCube():
         elif axis in RubikCube.GHI:
             return self.faces[1]
 
-    def turn(self, axis: Axis, direction: Direction, times: int) -> None:
+    def turn(
+        self,
+        axis: Axis,
+        direction: Direction,
+        times: int,
+        save_move:bool = True
+    ) -> None:
         match times % 4:
             case 1:
                 self.shift_one_time(axis, direction)
@@ -105,6 +112,19 @@ class RubikCube():
                 self.cross_swap(axis)
             case 3:
                 self.shift_one_time(axis, Direction.invert(direction))
+
+        if save_move:
+            self.history.append(Move(axis, direction, times))
+
+    def revert_last_move(self) -> None:
+        last_move = self.history.pop()
+        self.turn(
+            last_move.axis,
+            Direction.invert(last_move.direction),
+            last_move.times,
+            False
+        )
+        return last_move
 
     def shift_one_time(self, axis: Axis, direction: Direction) -> None:
         current_face = self.get_starting_face(axis)
@@ -188,3 +208,9 @@ class CubeFace():
 
     def is_solved(self) -> bool:
         return all(self.values[0] == v for v in self.values)
+
+class Move():
+    def __init__(self, axis: Axis, direction: Direction, times: int) -> None:
+        self.axis = axis
+        self.direction = direction
+        self.times = times
