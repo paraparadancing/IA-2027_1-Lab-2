@@ -17,6 +17,13 @@ class Direction(Enum):
     POSITIVE = auto()
     NEGATIVE = auto()
 
+    @classmethod
+    def invert(cls, direction: Direction) -> Direction:
+        if direction == Direction.POSITIVE:
+            return Direction.NEGATIVE
+        else:
+            return Direction.POSITIVE
+
 class FaceSide(Enum):
     NORTH = auto()
     EAST = auto()
@@ -84,6 +91,40 @@ class RubikCube():
     def is_solved(self) -> bool:
         return all(face.is_solved() for face in self.faces)
 
+    def get_starting_face(self, axis: Axis) -> CubeFace:
+        if axis in RubikCube.ABC or axis in RubikCube.DEF:
+            return self.faces[0]
+        elif axis in RubikCube.GHI:
+            return self.faces[1]
+
+    def turn(self, axis: Axis, direction: Direction, times: int) -> None:
+        match times % 4:
+            case 1:
+                self.shift_one_time(axis, direction)
+            case 2:
+                self.cross_swap(axis)
+            case 3:
+                self.shift_one_time(axis, Direction.invert(direction))
+
+    def shift_one_time(self, axis: Axis, direction: Direction) -> None:
+        current_face = self.get_starting_face(axis)
+        for _ in range(3):
+            next_face = current_face.get_neighbor_face(axis,direction)
+            current_face.swap_values(axis, next_face)
+            current_face = next_face
+
+    def cross_swap(self, axis: Axis) -> None:
+        current_face = self.get_starting_face(axis)
+        swapping_faces: list[CubeFace] = []
+        for _ in range(4):
+            swapping_faces.append(current_face)
+            current_face = current_face.get_neighbor_face(
+                axis, Direction.POSITIVE
+            )
+
+        swapping_faces[0].swap_values(axis, swapping_faces[2])
+        swapping_faces[1].swap_values(axis, swapping_faces[3])
+
     @classmethod
     def set_sides(
         cls,
@@ -104,6 +145,39 @@ class CubeFace():
             FaceSide.EAST: None,
             FaceSide.WEST: None
         }
+
+    def get_neighbor_face(self, axis: Axis, direction: Direction) -> CubeFace:
+        if axis in self.h_axes and direction == Direction.POSITIVE:
+            return self.neighbor_faces[FaceSide.NORTH]
+        elif axis in self.h_axes and direction == Direction.NEGATIVE:
+            return self.neighbor_faces[FaceSide.SOUTH]
+        elif axis in self.v_axes and direction == Direction.POSITIVE:
+            return self.neighbor_faces[FaceSide.EAST]
+        elif axis in self.v_axes and direction == Direction.NEGATIVE:
+            return self.neighbor_faces[FaceSide.WEST]
+
+    def swap_values(self, axis: Axis, other_face: CubeFace) -> None:
+        buffer = other_face.get_values(axis)
+        other_face.set_values(axis, self.get_values(axis))
+        self.set_values(axis, buffer)
+
+    def get_values(self, axis: Axis) -> tuple[int]:
+        if axis in self.h_axes:
+            index = self.h_axes.index(axis)
+            return tuple(self.values[v][index] for v in range(3))
+        elif axis in self.v_axes:
+            index = self.v_axes.index(axis)
+            return tuple(self.values[index][v] for v in range(3))
+
+    def set_values(self, axis: Axis, values: tuple[int]) -> None:
+        if axis in self.h_axes:
+            index = self.h_axes.index(axis)
+            for v in range(3):
+                self.values[v][index] = values[v]
+        elif axis in self.v_axes:
+            index = self.v_axes.index(axis)
+            for v in range(3):
+                self.values[index][v] = values[v]
 
     def set_neighbor_face(self, other: CubeFace, side: FaceSide) -> None:
         self.neighbor_faces[side] = other

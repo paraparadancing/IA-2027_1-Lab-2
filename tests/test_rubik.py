@@ -1,5 +1,5 @@
 from rubik import FaceSide
-from rubik import RubikCube, CubeFace, Axis
+from rubik import RubikCube, CubeFace, Axis, Direction
 import pytest
 
 def test_rubik_class():
@@ -32,6 +32,49 @@ def test_rubik_class():
     assert faces_connect(my_cube.faces[3], my_cube, (5, 0, 4, 2))
     assert faces_connect(my_cube.faces[4], my_cube, (2, 3, 0, 1))
     assert faces_connect(my_cube.faces[5], my_cube, (1, 0, 3, 2))
+
+def test_rubik_turning():
+    my_cube = RubikCube()
+    for ax in RubikCube.ABC:
+        turns_one_by_one(my_cube, ax, Direction.POSITIVE)
+    for ax in RubikCube.DEF:
+        turns_one_by_one(my_cube, ax, Direction.POSITIVE)
+    for ax in RubikCube.GHI:
+        turns_one_by_one(my_cube, ax, Direction.POSITIVE)
+
+    for ax in RubikCube.ABC:
+        turns_one_by_one(my_cube, ax, Direction.NEGATIVE)
+    for ax in RubikCube.DEF:
+        turns_one_by_one(my_cube, ax, Direction.NEGATIVE)
+    for ax in RubikCube.GHI:
+        turns_one_by_one(my_cube, ax, Direction.NEGATIVE)
+
+    for ax in RubikCube.ABC:
+        turns_twice(my_cube, ax, Direction.POSITIVE)
+    for ax in RubikCube.DEF:
+        turns_twice(my_cube, ax, Direction.POSITIVE)
+    for ax in RubikCube.GHI:
+        turns_twice(my_cube, ax, Direction.POSITIVE)
+
+def turns_one_by_one(cube: RubikCube, axis: Axis, direction: Direction) -> None:
+    cube.turn(axis, direction, 1)
+    assert not cube.is_solved()
+
+    cube.turn(axis, direction, 1)
+    assert not cube.is_solved()
+
+    cube.turn(axis, direction, 1)
+    assert not cube.is_solved()
+
+    cube.turn(axis, direction, 1)
+    assert cube.is_solved()
+
+def turns_twice(cube: RubikCube, axis: Axis, direction: Direction) -> None:
+    cube.turn(axis, direction, 2)
+    assert not cube.is_solved()
+
+    cube.turn(axis, direction, 2)
+    assert cube.is_solved()
 
 def axis_are_set(
     face: CubeFace, h_axes: tuple[Axis], v_axes: tuple[Axis]
