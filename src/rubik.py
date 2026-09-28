@@ -89,6 +89,9 @@ class RubikCube():
             (RubikCube.GHI, RubikCube.CBA)
         )
 
+    def get_state(self) -> str:
+        return "".join(fs.get_state() for fs in self.faces)
+
     def is_solved(self) -> bool:
         return all(face.is_solved() for face in self.faces)
 
@@ -165,6 +168,9 @@ class CubeFace():
             FaceSide.EAST: None,
             FaceSide.WEST: None
         }
+    
+    def get_state(self) -> str:
+        return "".join("".join(str(v) for v in r) for r in self.values)
 
     def get_neighbor_face(self, axis: Axis, direction: Direction) -> CubeFace:
         if axis in self.h_axes and direction == Direction.POSITIVE:

@@ -71,6 +71,22 @@ def test_history():
 
     assert my_cube.is_solved()
 
+def test_rubik_state():
+    my_cube = RubikCube()
+    initial_state = "000000000111111111222222222333333333444444444555555555"
+
+    assert my_cube.get_state() == initial_state
+
+    first_turn_state = "000333000111000111222111222333222333444444444555555555"
+    my_cube.turn(Axis.E, Direction.NEGATIVE, 1)
+
+    assert my_cube.get_state() == first_turn_state
+
+    second_turn_test = "050353050111000111242141242333222333404434404555212555"
+    my_cube.turn(Axis.B,Direction.NEGATIVE, 1)
+
+    assert my_cube.get_state() == second_turn_test
+
 def turns_one_by_one(cube: RubikCube, axis: Axis, direction: Direction) -> None:
     cube.turn(axis, direction, 1)
     assert not cube.is_solved()
