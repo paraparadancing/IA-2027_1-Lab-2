@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 
 
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 
 from PySide6.QtGui import QFont
 
@@ -92,6 +92,27 @@ COLORS = {
 
 
 
+
+
+# ==============================================================
+# HILO DE BÚSQUEDA (evita congelar la ventana)
+# ==============================================================
+
+class SearchWorker(QThread):
+
+    finished_search = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, function, cube, parent=None):
+        super().__init__(parent)
+        self.function = function
+        self.cube = cube
+
+    def run(self):
+        try:
+            self.finished_search.emit(self.function(self.cube))
+        except Exception as error:
+            self.failed.emit(str(error))
 
 
 # ==============================================================
@@ -170,7 +191,9 @@ class RubiksCubeGUI(QWidget):
 
         self.search_algorithms = SearchAlgorithms(
 
-            max_nodes=100000
+            max_states=15_000_000,
+
+            max_time=180.0
 
         )
 
@@ -185,6 +208,8 @@ class RubiksCubeGUI(QWidget):
 
 
         self.last_solution = []
+
+        self.worker = None
 
 
 
@@ -2676,147 +2701,85 @@ class RubiksCubeGUI(QWidget):
 
     def run_selected_algorithm(self):
 
+        # Si ya hay una búsqueda en curso, el botón funciona como
+        # "Cancelar".
 
+        if self.worker is not None and self.worker.isRunning():
 
-        algorithm_name = (
+            self.search_algorithms.cancel()
 
-            self.algorithm_combo.currentText()
+            self.run_algorithm_button.setEnabled(False)
 
-        )
-
-
-
-        algorithm_function = (
-
-            self.algorithm_map.get(
-
-                algorithm_name
-
-            )
-
-        )
-
-
-
-        if algorithm_function is None:
-
-
-
-            QMessageBox.warning(
-
-                self,
-
-                "Algorithm",
-
-                "The selected algorithm was not found."
-
-            )
-
-
+            self.run_algorithm_button.setText("Cancelling...")
 
             return
 
+        algorithm_name = self.algorithm_combo.currentText()
 
+        algorithm_function = self.algorithm_map.get(algorithm_name)
 
-        # ----------------------------------------------------------
+        if algorithm_function is None:
 
-        # DESACTIVAR BOTÓN DURANTE LA BÚSQUEDA
-
-        # ----------------------------------------------------------
-
-
-
-        self.run_algorithm_button.setEnabled(
-
-            False
-
-        )
-
-
-
-        self.run_algorithm_button.setText(
-
-            "Searching..."
-
-        )
-
-
-
-        QApplication.processEvents()
-
-
-
-        try:
-
-
-
-            cube_copy = (
-
-                self.get_cube_copy()
-
-            )
-
-
-
-            result = algorithm_function(
-
-                cube_copy
-
-            )
-
-
-
-            self.show_search_result(
-
-                result
-
-            )
-
-
-
-        except Exception as error:
-
-
-
-            QMessageBox.critical(
-
+            QMessageBox.warning(
                 self,
-
-                "Error",
-
-                (
-
-                    "Ocurrió un error durante "
-
-                    "la búsqueda:\n\n"
-
-                    f"{error}"
-
-                )
-
+                "Algorithm",
+                "The selected algorithm was not found."
             )
 
+            return
 
+        self.search_algorithms.cancel_requested = False
 
-        finally:
+        self.run_algorithm_button.setText("Cancel search")
 
+        self.algorithm_result_text.setPlainText(
+            "Searching... (límite: "
+            f"{self.search_algorithms.max_time:.0f} s)"
+        )
 
+        self.worker = SearchWorker(
+            algorithm_function,
+            self.get_cube_copy(),
+            self
+        )
 
-            self.run_algorithm_button.setEnabled(
+        self.worker.finished_search.connect(self.on_search_finished)
 
-                True
+        self.worker.failed.connect(self.on_search_failed)
 
-            )
+        self.worker.start()
 
+    def _restore_search_button(self):
 
+        self.run_algorithm_button.setEnabled(True)
 
-            self.run_algorithm_button.setText(
+        self.run_algorithm_button.setText("Find Solution")
 
-                "Find Solution"
+    def on_search_finished(self, result):
 
-            )
+        self._restore_search_button()
 
+        self.show_search_result(result)
 
+    def on_search_failed(self, error):
+
+        self._restore_search_button()
+
+        QMessageBox.critical(
+            self,
+            "Error",
+            f"Ocurrió un error durante la búsqueda:\n\n{error}"
+        )
+
+    def closeEvent(self, event):
+
+        if self.worker is not None and self.worker.isRunning():
+
+            self.search_algorithms.cancel()
+
+            self.worker.wait(3000)
+
+        super().closeEvent(event)
 
     # ==============================================================
 
@@ -2881,6 +2844,8 @@ class RubiksCubeGUI(QWidget):
             f"Algoritmo: {result.algorithm}\n"
 
             f"Nodos explorados: {result.explored_nodes}\n"
+
+            f"Estados en memoria: {result.stored_states}\n"
 
             f"Tiempo: {result.execution_time:.6f} s\n"
 

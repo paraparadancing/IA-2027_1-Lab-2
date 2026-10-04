@@ -1,7 +1,27 @@
+"""
+Algoritmos de búsqueda para el cubo de Rubik: A*, GBF y Bidireccional.
+
+Optimizaciones principales
+--------------------------
+1. Los 27 movimientos se precalculan UNA vez como permutaciones de los
+   54 stickers; aplicar un movimiento es un solo itemgetter (~0.5 us)
+   en lugar de construir un RubikCube completo (~70 us).
+2. Los estados son `bytes` de 54 posiciones (no tuplas de enteros):
+   ~5x menos memoria y hashing más rápido.
+3. No se guarda el padre de cada estado: solo el último movimiento
+   (un entero chico). El padre se recupera aplicando el movimiento
+   inverso, así que cada estado guardado cuesta mucho menos RAM.
+4. Poda de movimientos redundantes: no se mueve el mismo eje dos veces
+   seguidas y los ejes paralelos (A,B,C / D,E,F / G,H,I) conmutan, así
+   que solo se permite el orden creciente dentro de cada grupo.
+5. Límites duros de estados guardados (RAM), tiempo y cancelación, para
+   que la búsqueda termine con un mensaje en vez de trabarse.
+"""
+
 import heapq
-import math
 import time
 from itertools import count
+from operator import itemgetter, ne
 
 from rubik import RubikCube, Axis, Direction, Move
 
@@ -19,14 +39,138 @@ class SearchResult:
         execution_time=0.0,
         algorithm="",
         success=False,
-        message=""
+        message="",
+        stored_states=0
     ):
         self.moves = moves if moves is not None else []
-        self.explored_nodes = explored_nodes
+        self.explored_nodes = explored_nodes      # nodos expandidos
+        self.stored_states = stored_states        # estados en memoria
         self.execution_time = execution_time
         self.algorithm = algorithm
         self.success = success
         self.message = message
+
+
+# ==============================================================
+# TABLAS PRECALCULADAS (se construyen una sola vez al importar)
+# ==============================================================
+
+START = 27            # marca "sin movimiento previo" (raíz del árbol)
+
+
+def _build_tables():
+    # Índice de movimiento: 3*eje + {0: +1, 1: -1, 2: doble}
+    moves = []
+    for axis in Axis:
+        moves.append(Move(axis, Direction.POSITIVE, 1))
+        moves.append(Move(axis, Direction.NEGATIVE, 1))
+        moves.append(Move(axis, Direction.POSITIVE, 2))
+
+    # Permutación de cada movimiento: se etiquetan los 54 stickers con
+    # ids distintos, se aplica el movimiento real del cubo y se lee
+    # qué id quedó en cada posición.
+    getters = []
+    for mv in moves:
+        cube = RubikCube()
+        label = 0
+        for face in cube.faces:
+            face.values = [
+                [label + 3 * r + c for c in range(3)] for r in range(3)
+            ]
+            label += 9
+        cube.turn(mv.axis, mv.direction, mv.times, False)
+        perm = tuple(
+            v for face in cube.faces for row in face.values for v in row
+        )
+        getters.append(itemgetter(*perm))
+
+    # Movimiento inverso de cada índice.
+    inverse = []
+    for i in range(27):
+        r = i % 3
+        inverse.append(i + 1 if r == 0 else i - 1 if r == 1 else i)
+
+    # Movimientos permitidos después de cada movimiento previo.
+    allowed = []
+    for last in range(27):
+        last_axis = last // 3
+        last_group = last_axis // 3
+        allowed.append([
+            i for i in range(27)
+            if i // 3 != last_axis
+            and not (i // 9 == last_group and i // 3 < last_axis)
+        ])
+    allowed.append(list(range(27)))   # índice START: todo permitido
+
+    goal_cube = RubikCube()
+    goal = bytes(
+        v for face in goal_cube.faces for row in face.values for v in row
+    )
+
+    return moves, getters, inverse, allowed, goal
+
+
+_MOVES, _GET, _INV, _ALLOWED, _GOAL = _build_tables()
+
+
+def _climb(info, state):
+    """Movimientos desde la raíz hasta `state` (árbol hacia adelante)."""
+    out = []
+    while True:
+        i = info[state] & 31
+        if i == START:
+            break
+        out.append(i)
+        state = bytes(_GET[_INV[i]](state))
+    out.reverse()
+    return out
+
+
+def _descend(info, state):
+    """Movimientos desde `state` hasta la raíz (árbol del objetivo)."""
+    out = []
+    while True:
+        i = info[state] & 31
+        if i == START:
+            break
+        j = _INV[i]
+        out.append(j)
+        state = bytes(_GET[j](state))
+    return out
+
+
+_TABLE = {}              # estado -> distancia exacta al cubo resuelto
+_TABLE_DEPTH = 0
+
+
+def _ensure_table(depth):
+    """BFS desde el objetivo hasta `depth` (tabla de patrones truncada).
+
+    Un estado dentro de la tabla tiene distancia exacta; uno fuera tiene
+    distancia >= depth + 1. Con depth=4 son ~234 mil estados (~45 MB) y
+    tarda ~1 s; depth=5 ya serían 4.5 millones (~800 MB)."""
+    global _TABLE_DEPTH
+    if _TABLE_DEPTH >= depth:
+        return
+    table = {_GOAL: 0}
+    frontier = [(_GOAL, START)]
+    for d in range(1, depth + 1):
+        nxt = []
+        for state, last in frontier:
+            for i in _ALLOWED[last]:
+                n = bytes(_GET[i](state))
+                if n not in table:
+                    table[n] = d
+                    nxt.append((n, i))
+        frontier = nxt
+    _TABLE.clear()
+    _TABLE.update(table)
+    _TABLE_DEPTH = depth
+
+
+def _misplaced(state):
+    """Stickers que no coinciden con el cubo resuelto."""
+    return sum(map(ne, state, _GOAL))
 
 
 # ==============================================================
@@ -35,838 +179,289 @@ class SearchResult:
 
 class SearchAlgorithms:
 
-    def __init__(self, max_nodes=100000):
+    def __init__(
+        self,
+        max_nodes=None,
+        max_states=1_500_000,
+        max_time=60.0,
+        astar_weight=1.0,
+        use_table=True,
+        table_depth=4
+    ):
+        """
+        max_nodes    : tope de nodos expandidos (None = sin tope).
+        max_states   : tope de estados guardados en memoria. Con ~150 B
+                       por estado, 1.5 M son unos 250-400 MB.
+        max_time     : segundos máximos por búsqueda.
+        astar_weight : 1.0 = A* óptimo; >1 = A* ponderado (más rápido,
+                       solución no necesariamente óptima).
+        use_table    : usa la tabla de distancias exactas hasta
+                       `table_depth` movimientos del objetivo como
+                       heurística (A* y GBF).
+        """
         self.max_nodes = max_nodes
+        self.max_states = max_states
+        self.max_time = max_time
+        self.astar_weight = astar_weight
+        self.use_table = use_table
+        self.table_depth = table_depth
+        self.cancel_requested = False
 
-        # ----------------------------------------------------------
-        # Movimientos posibles
-        #
-        # Por cada eje:
-        # A+
-        # A-
-        # A2
-        #
-        # ... hasta I
-        # ----------------------------------------------------------
+        self.possible_moves = list(_MOVES)
+        self.goal_state = _GOAL
 
-        self.possible_moves = []
+    # ----------------------------------------------------------
+    # Utilidades
+    # ----------------------------------------------------------
 
-        for axis in Axis:
-
-            self.possible_moves.append(
-                Move(
-                    axis,
-                    Direction.POSITIVE,
-                    1
-                )
-            )
-
-            self.possible_moves.append(
-                Move(
-                    axis,
-                    Direction.NEGATIVE,
-                    1
-                )
-            )
-
-            self.possible_moves.append(
-                Move(
-                    axis,
-                    Direction.POSITIVE,
-                    2
-                )
-            )
-
-        # Estado objetivo
-        solved_cube = RubikCube()
-        self.goal_state = self.cube_to_state(
-            solved_cube
-        )
-
-    # ==========================================================
-    # CONVERSIÓN CUBO -> ESTADO
-    # ==========================================================
+    def cancel(self):
+        self.cancel_requested = True
 
     def cube_to_state(self, cube):
-
-        state = []
-
-        for face in cube.faces:
-
-            for row in face.values:
-
-                for value in row:
-
-                    state.append(value)
-
-        return tuple(state)
-
-    # ==========================================================
-    # CONVERSIÓN ESTADO -> CUBO
-    # ==========================================================
+        return bytes(
+            v for face in cube.faces for row in face.values for v in row
+        )
 
     def state_to_cube(self, state):
-
         cube = RubikCube()
-
         index = 0
-
         for face in cube.faces:
-
-            new_values = []
-
-            for row in range(3):
-
-                new_row = []
-
-                for col in range(3):
-
-                    new_row.append(
-                        state[index]
-                    )
-
-                    index += 1
-
-                new_values.append(
-                    new_row
-                )
-
-            face.values = new_values
-
+            face.values = [
+                list(state[index + 3 * r: index + 3 * r + 3])
+                for r in range(3)
+            ]
+            index += 9
         cube.history = []
-
         return cube
 
-    # ==========================================================
-    # APLICAR MOVIMIENTO SOBRE UN ESTADO
-    # ==========================================================
+    def verify_solution(self, cube, moves):
+        """Aplica `moves` con el cubo real y revisa que quede resuelto."""
+        copy = self.state_to_cube(self.cube_to_state(cube))
+        for m in moves:
+            copy.turn(m.axis, m.direction, m.times, False)
+        return self.cube_to_state(copy) == _GOAL
 
-    def apply_move(self, state, move):
+    def _table(self):
+        """(tabla, piso): `piso` es la cota para estados fuera de ella."""
+        if not self.use_table:
+            return {}, 0
+        _ensure_table(self.table_depth)
+        return _TABLE, _TABLE_DEPTH + 1
 
-        cube = self.state_to_cube(
-            state
+    def _limit_reason(self, expanded, stored, t0):
+        if self.cancel_requested:
+            return "Búsqueda cancelada."
+        if self.max_nodes is not None and expanded >= self.max_nodes:
+            return "Límite de nodos expandidos alcanzado."
+        if stored >= self.max_states:
+            return "Límite de memoria (estados guardados) alcanzado."
+        if time.perf_counter() - t0 >= self.max_time:
+            return "Límite de tiempo alcanzado."
+        return None
+
+    def _ok(self, name, t0, indices, expanded, stored, message):
+        return SearchResult(
+            moves=[_MOVES[i] for i in indices],
+            explored_nodes=expanded,
+            execution_time=time.perf_counter() - t0,
+            algorithm=name,
+            success=True,
+            message=message,
+            stored_states=stored
         )
 
-        cube.turn(
-            move.axis,
-            move.direction,
-            move.times,
-            False
+    def _fail(self, name, t0, expanded, stored, reason):
+        return SearchResult(
+            moves=[],
+            explored_nodes=expanded,
+            execution_time=time.perf_counter() - t0,
+            algorithm=name,
+            success=False,
+            message=f"No se encontró solución. {reason}",
+            stored_states=stored
         )
-
-        return self.cube_to_state(
-            cube
-        )
-
-    # ==========================================================
-    # MOVIMIENTO INVERSO
-    # ==========================================================
-
-    def inverse_move(self, move):
-
-        # Un movimiento doble es su propio inverso.
-
-        if move.times % 4 == 2:
-
-            return Move(
-                move.axis,
-                Direction.POSITIVE,
-                2
-            )
-
-        return Move(
-            move.axis,
-            Direction.invert(
-                move.direction
-            ),
-            move.times
-        )
-
-    # ==========================================================
-    # HEURÍSTICA
-    # ==========================================================
-
-    def heuristic(self, state):
-        """
-        Cuenta cuántas casillas están fuera
-        de su cara objetivo.
-
-        Cada cara resuelta contiene únicamente
-        su propio número:
-
-            cara 0 -> 0
-            cara 1 -> 1
-            ...
-            cara 5 -> 5
-
-        Dividimos entre 12 porque un giro puede
-        afectar varias casillas simultáneamente.
-        """
-
-        misplaced = 0
-
-        index = 0
-
-        for face_index in range(6):
-
-            for _ in range(9):
-
-                if state[index] != face_index:
-
-                    misplaced += 1
-
-                index += 1
-
-        return math.ceil(
-            misplaced / 12
-        )
-
-    # ==========================================================
-    # RECONSTRUIR CAMINO
-    # ==========================================================
-
-    def reconstruct_path(
-        self,
-        parents,
-        final_state
-    ):
-
-        path = []
-
-        current_state = final_state
-
-        while parents[current_state] is not None:
-
-            previous_state, move = (
-                parents[current_state]
-            )
-
-            path.append(
-                move
-            )
-
-            current_state = (
-                previous_state
-            )
-
-        path.reverse()
-
-        return path
 
     # ==========================================================
     # A*
+    #
+    # h(n) = max(ceil(stickers_mal_colocados / 12), distancia en la tabla
+    # truncada). Un movimiento cambia 12 stickers como máximo y la tabla
+    # es exacta (o una cota inferior), así que h es admisible y
+    # consistente.
     # ==========================================================
 
     def astar(self, cube):
+        name = "A*"
+        t0 = time.perf_counter()
+        start = self.cube_to_state(cube)
 
-        algorithm_name = "A*"
+        if start == _GOAL:
+            return self._ok(name, t0, [], 0, 1, "El cubo ya está resuelto.")
 
-        start_time = time.perf_counter()
+        w = self.astar_weight
+        tie = count()
+        tab, floor = self._table()
+        tget = tab.get
 
-        start_state = self.cube_to_state(
-            cube
-        )
+        def h_of(state):
+            h = (_misplaced(state) + 11) // 12
+            t = tget(state, floor)
+            return t if t > h else h
 
-        # Ya está resuelto.
+        # info[estado] = (g << 5) | último_movimiento
+        info = {start: START}
+        h0 = h_of(start)
+        heap = [(w * h0, h0, next(tie), 0, start)]
+        expanded = 0
 
-        if start_state == self.goal_state:
+        heappush = heapq.heappush
+        heappop = heapq.heappop
 
-            return SearchResult(
-                moves=[],
-                explored_nodes=0,
-                execution_time=(
-                    time.perf_counter()
-                    - start_time
-                ),
-                algorithm=algorithm_name,
-                success=True,
-                message="El cubo ya está resuelto."
-            )
+        while heap:
+            _, _, _, g, state = heappop(heap)
+            v = info[state]
 
-        # ------------------------------------------------------
-        # Cola de prioridad
-        #
-        # (f, contador, g, estado)
-        # ------------------------------------------------------
-
-        queue = []
-
-        unique_counter = count()
-
-        start_h = self.heuristic(
-            start_state
-        )
-
-        heapq.heappush(
-            queue,
-            (
-                start_h,
-                next(unique_counter),
-                0,
-                start_state
-            )
-        )
-
-        g_score = {
-            start_state: 0
-        }
-
-        parents = {
-            start_state: None
-        }
-
-        explored_nodes = 0
-
-        closed = set()
-
-        # ------------------------------------------------------
-        # BÚSQUEDA
-        # ------------------------------------------------------
-
-        while queue:
-
-            f_score, _, current_g, current_state = (
-                heapq.heappop(queue)
-            )
-
-            if current_state in closed:
+            if (v >> 5) != g:          # entrada obsoleta (hubo mejor g)
                 continue
 
-            closed.add(
-                current_state
-            )
-
-            explored_nodes += 1
-
-            # --------------------------------------------------
-            # OBJETIVO
-            # --------------------------------------------------
-
-            if current_state == self.goal_state:
-
-                path = self.reconstruct_path(
-                    parents,
-                    current_state
+            if state == _GOAL:
+                return self._ok(
+                    name, t0, _climb(info, state), expanded, len(info),
+                    "Solución encontrada."
                 )
 
-                elapsed = (
-                    time.perf_counter()
-                    - start_time
-                )
+            expanded += 1
+            if not expanded & 1023:
+                reason = self._limit_reason(expanded, len(info), t0)
+                if reason:
+                    return self._fail(name, t0, expanded, len(info), reason)
 
-                return SearchResult(
-                    moves=path,
-                    explored_nodes=explored_nodes,
-                    execution_time=elapsed,
-                    algorithm=algorithm_name,
-                    success=True,
-                    message="Solución encontrada."
-                )
+            ng = g + 1
+            for i in _ALLOWED[v & 31]:
+                n = bytes(_GET[i](state))
+                old = info.get(n)
+                if old is not None and (old >> 5) <= ng:
+                    continue
+                info[n] = (ng << 5) | i
+                hn = h_of(n)
+                heappush(heap, (ng + w * hn, hn, next(tie), ng, n))
 
-            # --------------------------------------------------
-            # LÍMITE
-            # --------------------------------------------------
-
-            if explored_nodes >= self.max_nodes:
-
-                break
-
-            # --------------------------------------------------
-            # SUCESORES
-            # --------------------------------------------------
-
-            for move in self.possible_moves:
-
-                new_state = self.apply_move(
-                    current_state,
-                    move
-                )
-
-                tentative_g = (
-                    current_g + 1
-                )
-
-                if tentative_g < g_score.get(
-                    new_state,
-                    float("inf")
-                ):
-
-                    g_score[new_state] = (
-                        tentative_g
-                    )
-
-                    parents[new_state] = (
-                        current_state,
-                        move
-                    )
-
-                    h = self.heuristic(
-                        new_state
-                    )
-
-                    f = tentative_g + h
-
-                    heapq.heappush(
-                        queue,
-                        (
-                            f,
-                            next(unique_counter),
-                            tentative_g,
-                            new_state
-                        )
-                    )
-
-        elapsed = (
-            time.perf_counter()
-            - start_time
-        )
-
-        return SearchResult(
-            moves=[],
-            explored_nodes=explored_nodes,
-            execution_time=elapsed,
-            algorithm=algorithm_name,
-            success=False,
-            message=(
-                "No se encontró solución dentro "
-                "del límite de nodos."
-            )
-        )
+        return self._fail(name, t0, expanded, len(info), "Espacio agotado.")
 
     # ==========================================================
     # GREEDY BEST-FIRST SEARCH
+    #
+    # h(n) = distancia exacta si el estado está en la tabla truncada;
+    # si no, piso + stickers mal colocados. No es óptimo.
     # ==========================================================
 
     def gbf(self, cube):
+        name = "GBF"
+        t0 = time.perf_counter()
+        start = self.cube_to_state(cube)
 
-        algorithm_name = "GBF"
+        if start == _GOAL:
+            return self._ok(name, t0, [], 0, 1, "El cubo ya está resuelto.")
 
-        start_time = time.perf_counter()
+        tie = count()
+        tab, floor = self._table()
+        tget = tab.get
 
-        start_state = self.cube_to_state(
-            cube
-        )
+        def h_of(state):
+            t = tget(state)
+            return t if t is not None else floor + _misplaced(state)
 
-        if start_state == self.goal_state:
+        info = {start: START}
+        heap = [(h_of(start), 0, next(tie), start)]
+        expanded = 0
 
-            return SearchResult(
-                moves=[],
-                explored_nodes=0,
-                execution_time=(
-                    time.perf_counter()
-                    - start_time
-                ),
-                algorithm=algorithm_name,
-                success=True,
-                message="El cubo ya está resuelto."
-            )
+        heappush = heapq.heappush
+        heappop = heapq.heappop
 
-        queue = []
+        while heap:
+            _, depth, _, state = heappop(heap)
 
-        unique_counter = count()
+            expanded += 1
+            if not expanded & 1023:
+                reason = self._limit_reason(expanded, len(info), t0)
+                if reason:
+                    return self._fail(name, t0, expanded, len(info), reason)
 
-        start_h = self.heuristic(
-            start_state
-        )
-
-        heapq.heappush(
-            queue,
-            (
-                start_h,
-                next(unique_counter),
-                start_state
-            )
-        )
-
-        parents = {
-            start_state: None
-        }
-
-        visited = set()
-
-        explored_nodes = 0
-
-        while queue:
-
-            _, _, current_state = (
-                heapq.heappop(queue)
-            )
-
-            if current_state in visited:
-                continue
-
-            visited.add(
-                current_state
-            )
-
-            explored_nodes += 1
-
-            # --------------------------------------------------
-            # OBJETIVO
-            # --------------------------------------------------
-
-            if current_state == self.goal_state:
-
-                path = self.reconstruct_path(
-                    parents,
-                    current_state
-                )
-
-                elapsed = (
-                    time.perf_counter()
-                    - start_time
-                )
-
-                return SearchResult(
-                    moves=path,
-                    explored_nodes=explored_nodes,
-                    execution_time=elapsed,
-                    algorithm=algorithm_name,
-                    success=True,
-                    message="Solución encontrada."
-                )
-
-            if explored_nodes >= self.max_nodes:
-                break
-
-            # --------------------------------------------------
-            # SUCESORES
-            # --------------------------------------------------
-
-            for move in self.possible_moves:
-
-                new_state = self.apply_move(
-                    current_state,
-                    move
-                )
-
-                if (
-                    new_state in visited
-                    or new_state in parents
-                ):
+            nd = depth + 1
+            for i in _ALLOWED[info[state] & 31]:
+                n = bytes(_GET[i](state))
+                if n in info:
                     continue
+                info[n] = i
 
-                parents[new_state] = (
-                    current_state,
-                    move
-                )
-
-                h = self.heuristic(
-                    new_state
-                )
-
-                heapq.heappush(
-                    queue,
-                    (
-                        h,
-                        next(unique_counter),
-                        new_state
+                if n == _GOAL:
+                    return self._ok(
+                        name, t0, _climb(info, n), expanded, len(info),
+                        "Solución encontrada."
                     )
-                )
 
-        elapsed = (
-            time.perf_counter()
-            - start_time
-        )
+                heappush(heap, (h_of(n), nd, next(tie), n))
 
-        return SearchResult(
-            moves=[],
-            explored_nodes=explored_nodes,
-            execution_time=elapsed,
-            algorithm=algorithm_name,
-            success=False,
-            message=(
-                "No se encontró solución dentro "
-                "del límite de nodos."
-            )
-        )
+        return self._fail(name, t0, expanded, len(info), "Espacio agotado.")
 
     # ==========================================================
-    # BIDIRECCIONAL
+    # BIDIRECCIONAL (BFS desde el inicio y desde el objetivo)
+    #
+    # En cada ronda se expande por completo la frontera más chica.
+    # La solución puede ser 1 movimiento más larga que la óptima.
     # ==========================================================
 
     def bidirectional(self, cube):
+        name = "Bidirectional"
+        t0 = time.perf_counter()
+        start = self.cube_to_state(cube)
 
-        algorithm_name = "Bidirectional"
+        if start == _GOAL:
+            return self._ok(name, t0, [], 0, 1, "El cubo ya está resuelto.")
 
-        start_time = time.perf_counter()
+        tree_a = {start: START}
+        tree_b = {_GOAL: START}
+        front_a = [start]
+        front_b = [_GOAL]
+        expanded = 0
 
-        start_state = self.cube_to_state(
-            cube
-        )
+        while front_a and front_b:
+            forward = len(front_a) <= len(front_b)
+            if forward:
+                frontier, mine, other = front_a, tree_a, tree_b
+            else:
+                frontier, mine, other = front_b, tree_b, tree_a
 
-        goal_state = self.goal_state
+            nxt = []
+            for state in frontier:
+                expanded += 1
+                if not expanded & 1023:
+                    stored = len(tree_a) + len(tree_b)
+                    reason = self._limit_reason(expanded, stored, t0)
+                    if reason:
+                        return self._fail(name, t0, expanded, stored, reason)
 
-        if start_state == goal_state:
-
-            return SearchResult(
-                moves=[],
-                explored_nodes=0,
-                execution_time=(
-                    time.perf_counter()
-                    - start_time
-                ),
-                algorithm=algorithm_name,
-                success=True,
-                message="El cubo ya está resuelto."
-            )
-
-        # ------------------------------------------------------
-        # FRONTERAS
-        # ------------------------------------------------------
-
-        frontier_start = {
-            start_state
-        }
-
-        frontier_goal = {
-            goal_state
-        }
-
-        # ------------------------------------------------------
-        # PADRES
-        # ------------------------------------------------------
-
-        parents_start = {
-            start_state: None
-        }
-
-        parents_goal = {
-            goal_state: None
-        }
-
-        explored_nodes = 0
-
-        while (
-            frontier_start
-            and frontier_goal
-        ):
-
-            # ==================================================
-            # EXPANDIR DESDE EL ESTADO INICIAL
-            # ==================================================
-
-            next_frontier_start = set()
-
-            for current_state in frontier_start:
-
-                explored_nodes += 1
-
-                if explored_nodes >= self.max_nodes:
-                    break
-
-                for move in self.possible_moves:
-
-                    new_state = self.apply_move(
-                        current_state,
-                        move
-                    )
-
-                    if new_state in parents_start:
+                for i in _ALLOWED[mine[state] & 31]:
+                    n = bytes(_GET[i](state))
+                    if n in mine:
                         continue
+                    mine[n] = i
 
-                    parents_start[new_state] = (
-                        current_state,
-                        move
-                    )
-
-                    # ------------------------------------------
-                    # INTERSECCIÓN
-                    # ------------------------------------------
-
-                    if new_state in parents_goal:
-
-                        elapsed = (
-                            time.perf_counter()
-                            - start_time
+                    if n in other:
+                        path = _climb(tree_a, n) + _descend(tree_b, n)
+                        return self._ok(
+                            name, t0, path, expanded,
+                            len(tree_a) + len(tree_b),
+                            "Solución encontrada."
                         )
+                    nxt.append(n)
 
-                        path = (
-                            self.build_bidirectional_path(
-                                parents_start,
-                                parents_goal,
-                                new_state
-                            )
-                        )
+            if forward:
+                front_a = nxt
+            else:
+                front_b = nxt
 
-                        return SearchResult(
-                            moves=path,
-                            explored_nodes=explored_nodes,
-                            execution_time=elapsed,
-                            x=algorithm_name,
-                            success=True,
-                            message="Solución encontrada."
-                        )
-
-                    next_frontier_start.add(
-                        new_state
-                    )
-
-            if explored_nodes >= self.max_nodes:
-                break
-
-            frontier_start = (
-                next_frontier_start
-            )
-
-            # ==================================================
-            # EXPANDIR DESDE EL OBJETIVO
-            # ==================================================
-
-            next_frontier_goal = set()
-
-            for current_state in frontier_goal:
-
-                explored_nodes += 1
-
-                if explored_nodes >= self.max_nodes:
-                    break
-
-                for move in self.possible_moves:
-
-                    new_state = self.apply_move(
-                        current_state,
-                        move
-                    )
-
-                    if new_state in parents_goal:
-                        continue
-
-                    parents_goal[new_state] = (
-                        current_state,
-                        move
-                    )
-
-                    # ------------------------------------------
-                    # INTERSECCIÓN
-                    # ------------------------------------------
-
-                    if new_state in parents_start:
-
-                        elapsed = (
-                            time.perf_counter()
-                            - start_time
-                        )
-
-                        path = (
-                            self.build_bidirectional_path(
-                                parents_start,
-                                parents_goal,
-                                new_state
-                            )
-                        )
-
-                        return SearchResult(
-                            moves=path,
-                            explored_nodes=explored_nodes,
-                            execution_time=elapsed,
-                            algorithm=algorithm_name,
-                            success=True,
-                            message="Solución encontrada."
-                        )
-
-                    next_frontier_goal.add(
-                        new_state
-                    )
-
-            if explored_nodes >= self.max_nodes:
-                break
-
-            frontier_goal = (
-                next_frontier_goal
-            )
-
-        elapsed = (
-            time.perf_counter()
-            - start_time
-        )
-
-        return SearchResult(
-            moves=[],
-            explored_nodes=explored_nodes,
-            execution_time=elapsed,
-            algorithm=algorithm_name,
-            success=False,
-            message=(
-                "No se encontró solución dentro "
-                "del límite de nodos."
-            )
-        )
-
-    # ==========================================================
-    # CONSTRUIR SOLUCIÓN BIDIRECCIONAL
-    # ==========================================================
-
-    def build_bidirectional_path(
-        self,
-        parents_start,
-        parents_goal,
-        meeting_state
-    ):
-
-        # ------------------------------------------------------
-        # INICIO -> INTERSECCIÓN
-        # ------------------------------------------------------
-
-        first_half = []
-
-        current_state = meeting_state
-
-        while (
-            parents_start[current_state]
-            is not None
-        ):
-
-            previous_state, move = (
-                parents_start[current_state]
-            )
-
-            first_half.append(
-                move
-            )
-
-            current_state = (
-                previous_state
-            )
-
-        first_half.reverse()
-
-        # ------------------------------------------------------
-        # INTERSECCIÓN -> OBJETIVO
-        # ------------------------------------------------------
-
-        second_half = []
-
-        current_state = meeting_state
-
-        while (
-            parents_goal[current_state]
-            is not None
-        ):
-
-            previous_state, move = (
-                parents_goal[current_state]
-            )
-
-            # El árbol del objetivo se construyó
-            # desde el objetivo hacia afuera.
-            #
-            # Por eso debemos invertir cada
-            # movimiento para regresar al objetivo.
-
-            inverse = self.inverse_move(
-                move
-            )
-
-            second_half.append(
-                inverse
-            )
-
-            current_state = (
-                previous_state
-            )
-
-        return (
-            first_half
-            + second_half
+        return self._fail(
+            name, t0, expanded, len(tree_a) + len(tree_b),
+            "Espacio agotado."
         )

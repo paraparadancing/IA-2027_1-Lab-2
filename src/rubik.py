@@ -1,3 +1,4 @@
+from __future__ import annotations
 from enum import Enum, auto
 
 class Axis(Enum):
@@ -207,7 +208,8 @@ class CubeFace():
         self.v_axes = v_axes
 
     def is_solved(self) -> bool:
-        return all(self.values[0] == v for v in self.values)
+        color = self.values[0][0]
+        return all(v == color for row in self.values for v in row)
 
 class Move():
     def __init__(self, axis: Axis, direction: Direction, times: int) -> None:
